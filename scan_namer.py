@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-scan-namer - Automatically rename scanned PDFs based on their contents.
+scan-namer - Automatically rename PDFs based on their contents.
 
-Uses OCR to extract text from scanned PDFs, then calls Claude to determine
-a descriptive filename with the document date.
+Uses OCR to extract text from PDFs, then calls Claude to determine
+a descriptive filename with the document date. Processed files are
+moved into a 'named' subdirectory; files that can't be processed
+are moved into a 'failed' subdirectory.
 
 Usage:
-    # Process all scan-named PDFs in a folder (one-time)
+    # Process all PDFs in a folder (one-time)
     python scan_namer.py /path/to/scans
 
     # Watch folder for new files and rename automatically
@@ -37,6 +39,7 @@ import re
 import sys
 import json
 import time
+import shutil
 import logging
 import argparse
 from pathlib import Path
@@ -60,9 +63,6 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Regex pattern for scan-named files (e.g., 20250413_004096.pdf)
-SCAN_NAME_PATTERN = re.compile(r"^\d{8}_\d{4,}\.pdf$", re.IGNORECASE)
-
 # OCR settings
 OCR_DPI = 200
 OCR_MAX_PAGES = 2  # Usually first 1-2 pages have all the info we need
@@ -74,6 +74,10 @@ SETTLE_TIME = 10
 
 # Polling interval for watch mode (seconds)
 WATCH_INTERVAL = 30
+
+# Subdirectory names for processed files
+NAMED_DIR = "named"
+FAILED_DIR = "failed"
 
 # Log file name (placed in the scan folder)
 LOG_FILENAME = "scan_namer.log"
@@ -231,32 +235,40 @@ def determine_filename(
 # Rename logic
 # ---------------------------------------------------------------------------
 
-def safe_rename(pdf_path: Path, new_name: str, dry_run: bool, logger: logging.Logger) -> bool:
-    """Rename a file, handling conflicts by appending (2), (3), etc."""
-    folder = pdf_path.parent
-    target = folder / new_name
+def ensure_subdirs(folder: Path, logger: logging.Logger) -> tuple[Path, Path]:
+    """Create the named/ and failed/ subdirectories if they don't exist."""
+    named_dir = folder / NAMED_DIR
+    failed_dir = folder / FAILED_DIR
+    named_dir.mkdir(exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+    return named_dir, failed_dir
+
+
+def move_to_dir(pdf_path: Path, dest_dir: Path, new_name: str, dry_run: bool, logger: logging.Logger) -> bool:
+    """Move a file into a subdirectory with a new name, handling conflicts."""
+    target = dest_dir / new_name
 
     # Handle conflicts
-    if target.exists() and target != pdf_path:
+    if target.exists():
         stem = Path(new_name).stem
         suffix = Path(new_name).suffix
         counter = 2
         while target.exists():
             new_name = f"{stem} ({counter}){suffix}"
-            target = folder / new_name
+            target = dest_dir / new_name
             counter += 1
-        logger.info(f"Conflict resolved: using {new_name}")
+        logger.info(f"  Conflict resolved: using {new_name}")
 
     if dry_run:
-        logger.info(f"[DRY RUN] {pdf_path.name} -> {new_name}")
+        logger.info(f"[DRY RUN] {pdf_path.name} -> {dest_dir.name}/{new_name}")
         return True
 
     try:
-        pdf_path.rename(target)
-        logger.info(f"Renamed: {pdf_path.name} -> {new_name}")
+        shutil.move(str(pdf_path), str(target))
+        logger.info(f"  Moved: {pdf_path.name} -> {dest_dir.name}/{new_name}")
         return True
     except Exception as e:
-        logger.error(f"Failed to rename {pdf_path.name}: {e}")
+        logger.error(f"  Failed to move {pdf_path.name}: {e}")
         return False
 
 
@@ -264,29 +276,33 @@ def safe_rename(pdf_path: Path, new_name: str, dry_run: bool, logger: logging.Lo
 # Process files
 # ---------------------------------------------------------------------------
 
-def find_scan_files(folder: Path) -> list[Path]:
-    """Find all PDF files matching the scan-name pattern."""
+def find_pdf_files(folder: Path) -> list[Path]:
+    """Find all PDF files in the root of the folder (not in subdirectories)."""
     return sorted([
         f for f in folder.iterdir()
-        if f.is_file() and SCAN_NAME_PATTERN.match(f.name)
+        if f.is_file() and f.suffix.lower() == ".pdf"
     ])
 
 
 def process_file(
     pdf_path: Path,
+    named_dir: Path,
+    failed_dir: Path,
     client: anthropic.Anthropic,
     model: str,
     dry_run: bool,
     logger: logging.Logger,
 ) -> bool:
-    """Process a single scan-named PDF: OCR -> Claude -> rename."""
+    """Process a single PDF: OCR -> Claude -> rename and move to named/, or move to failed/."""
     logger.info(f"Processing: {pdf_path.name} ({pdf_path.stat().st_size / 1024:.0f} KB)")
 
     # Extract text via OCR
     logger.info(f"  OCR: extracting text from {pdf_path.name}...")
     ocr_text = extract_text(pdf_path, logger)
     if not ocr_text:
-        logger.warning(f"  OCR: no text extracted from {pdf_path.name}, skipping")
+        logger.warning(f"  OCR: no text extracted from {pdf_path.name}")
+        logger.info(f"  Moving to {FAILED_DIR}/")
+        move_to_dir(pdf_path, failed_dir, pdf_path.name, dry_run, logger)
         return False
     logger.info(f"  OCR: extracted {len(ocr_text)} chars from {pdf_path.name}")
 
@@ -294,12 +310,14 @@ def process_file(
     logger.info(f"  AI: requesting filename suggestion for {pdf_path.name}...")
     new_name = determine_filename(ocr_text, pdf_path.name, client, model, logger)
     if not new_name:
-        logger.warning(f"  AI: could not determine name for {pdf_path.name}, skipping")
+        logger.warning(f"  AI: could not determine name for {pdf_path.name}")
+        logger.info(f"  Moving to {FAILED_DIR}/")
+        move_to_dir(pdf_path, failed_dir, pdf_path.name, dry_run, logger)
         return False
-    logger.info(f"  AI: suggested \"{new_name}\" for {pdf_path.name}")
+    logger.info(f"  AI: suggested \"{new_name}\"")
 
-    # Rename
-    return safe_rename(pdf_path, new_name, dry_run, logger)
+    # Move to named/ with new name
+    return move_to_dir(pdf_path, named_dir, new_name, dry_run, logger)
 
 
 def process_folder(
@@ -309,19 +327,21 @@ def process_folder(
     dry_run: bool,
     logger: logging.Logger,
 ) -> tuple[int, int]:
-    """Process all scan-named files in a folder. Returns (success, fail) counts."""
-    files = find_scan_files(folder)
+    """Process all PDF files in a folder. Returns (success, fail) counts."""
+    named_dir, failed_dir = ensure_subdirs(folder, logger)
+
+    files = find_pdf_files(folder)
     if not files:
-        logger.info("No scan-named PDF files found")
+        logger.info("No PDF files found to process")
         return 0, 0
 
-    logger.info(f"Found {len(files)} scan-named PDF(s) to process")
+    logger.info(f"Found {len(files)} PDF(s) to process")
 
     success = 0
     fail = 0
     for i, f in enumerate(files, 1):
         logger.info(f"[{i}/{len(files)}] {f.name}")
-        if process_file(f, client, model, dry_run, logger):
+        if process_file(f, named_dir, failed_dir, client, model, dry_run, logger):
             success += 1
         else:
             fail += 1
@@ -330,7 +350,7 @@ def process_folder(
         if i < len(files):
             time.sleep(1)
 
-    logger.info(f"Done: {success} renamed, {fail} skipped/failed")
+    logger.info(f"Done: {success} named, {fail} failed")
     return success, fail
 
 
@@ -345,32 +365,35 @@ def watch_folder(
     dry_run: bool,
     logger: logging.Logger,
 ):
-    """Watch folder for new scan-named PDFs and rename them automatically."""
-    logger.info(f"Watching {folder} for new scanned PDFs (Ctrl+C to stop)")
+    """Watch folder for new PDFs and rename them automatically."""
+    named_dir, failed_dir = ensure_subdirs(folder, logger)
+
+    logger.info(f"Watching {folder} for new PDFs (Ctrl+C to stop)")
     logger.info(f"Polling every {WATCH_INTERVAL}s, settle time {SETTLE_TIME}s")
+    logger.info(f"Named files -> {NAMED_DIR}/, failed files -> {FAILED_DIR}/")
 
     # Track files we've processed (by original name) to avoid reprocessing
     processed: set[str] = set()
 
-    # Process any existing scan-named files first
-    existing = find_scan_files(folder)
+    # Process any existing PDF files first
+    existing = find_pdf_files(folder)
     if existing:
-        logger.info(f"Found {len(existing)} existing scan-named file(s) to process")
+        logger.info(f"Found {len(existing)} existing PDF(s) to process")
         for i, f in enumerate(existing, 1):
-            logger.info(f"[startup {i}/{len(existing)}] Processing existing file: {f.name}")
+            logger.info(f"[startup {i}/{len(existing)}] {f.name}")
             processed.add(f.name)
-            process_file(f, client, model, dry_run, logger)
+            process_file(f, named_dir, failed_dir, client, model, dry_run, logger)
             if i < len(existing):
                 time.sleep(1)
-        logger.info(f"Finished processing existing files. Now watching for new ones...")
+        logger.info("Finished processing existing files. Now watching for new ones...")
     else:
-        logger.info("No existing scan-named files found. Watching for new ones...")
+        logger.info("No existing PDF files found. Watching for new ones...")
 
     try:
         while True:
             time.sleep(WATCH_INTERVAL)
 
-            current_files = find_scan_files(folder)
+            current_files = find_pdf_files(folder)
             new_files = [
                 f for f in current_files
                 if f.name not in processed
@@ -389,7 +412,7 @@ def watch_folder(
 
                 logger.info(f"New file detected: {f.name}")
                 processed.add(f.name)
-                process_file(f, client, model, dry_run, logger)
+                process_file(f, named_dir, failed_dir, client, model, dry_run, logger)
 
     except KeyboardInterrupt:
         logger.info("Watch mode stopped by user")
@@ -401,11 +424,11 @@ def watch_folder(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="scan-namer - Rename scanned PDFs based on their contents using OCR + Claude AI",
+        description="scan-namer - Rename PDFs based on their contents using OCR + Claude AI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s /path/to/scans                  Process all scan-named PDFs
+  %(prog)s /path/to/scans                  Process all PDFs in folder
   %(prog)s /path/to/scans --watch           Watch for new files continuously
   %(prog)s /path/to/scans --dry-run         Preview renames without doing them
   %(prog)s /path/to/scans --model claude-sonnet-4-5   Use a different model

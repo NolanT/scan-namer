@@ -1,15 +1,16 @@
 # scan-namer
 
-Automatically rename scanned PDFs based on their contents using OCR and Claude AI.
+Automatically rename PDFs based on their contents using OCR and Claude AI.
 
-Turns files like `20250413_004096.pdf` into `2025-03-27 Cadence Bank Lien Release.pdf`.
+Drop any PDF into the watched folder and it gets renamed to something like `2025-03-27 Cadence Bank Lien Release.pdf` and moved into a `named/` subdirectory. Files that can't be processed (blank pages, no readable text) are moved to `failed/`.
 
 ## How It Works
 
-1. Watches a folder for PDFs with scan-style names (e.g., `20250413_004096.pdf`)
-2. Uses OCR (Tesseract) to extract text from the scanned pages
+1. Watches a folder for any PDF files
+2. Uses OCR (Tesseract) to extract text from the pages
 3. Sends the text to Claude AI to determine a descriptive filename with the document date
-4. Renames the file automatically
+4. Moves the renamed file into the `named/` subdirectory
+5. Files that can't be read or named are moved to `failed/`
 
 ## Quick Start (Synology NAS)
 
@@ -103,7 +104,7 @@ docker pull ghcr.io/NolanT/scan-namer:sha-abc1234
 
 ### Watch mode (default)
 
-Runs continuously, checking for new scan-named PDFs every 30 seconds:
+Runs continuously, processing existing PDFs on startup then checking for new ones every 30 seconds:
 
 ```bash
 docker compose up -d
@@ -111,7 +112,7 @@ docker compose up -d
 
 ### One-time batch
 
-Process all current scan-named files and exit:
+Process all current PDFs and exit:
 
 ```yaml
 # In docker-compose.yml, add:
@@ -148,13 +149,26 @@ command: ["/scans", "--watch", "--settle-time", "15", "--watch-interval", "60", 
 
 Using Claude Haiku (default), each file costs roughly $0.001 to process. A batch of 100 files would cost about $0.10.
 
-## File Name Pattern
+## Folder Structure
 
-The script looks for PDFs matching the pattern `XXXXXXXX_XXXX.pdf` (8 digits, underscore, 4+ digits). This matches the default naming from most document scanners. Files that don't match this pattern are left untouched.
+After processing, your scan folder will look like:
+
+```
+/scans/
+  named/              # Successfully renamed files
+    2025-03-27 Cadence Bank Lien Release.pdf
+    2025-01-15 Chase Credit Card Statement.pdf
+  failed/             # Files that couldn't be processed
+    blank_page.pdf
+  scan_namer.log      # Processing log
+  new_scan.pdf        # Unprocessed files waiting in root
+```
+
+Only PDFs in the root of the watched folder are processed. Files already in `named/` or `failed/` are left alone.
 
 ## Troubleshooting
 
-**No text extracted**: The PDF might be blank or contain only photos. These are skipped.
+**No text extracted**: The PDF might be blank or contain only photos. These are moved to `failed/`.
 
 **Wrong date picked**: Claude uses the document's content date (invoice date, letter date, etc.), not the scan date. Occasionally OCR errors can cause misreads — check the log for the OCR text.
 
