@@ -280,19 +280,23 @@ def process_file(
     logger: logging.Logger,
 ) -> bool:
     """Process a single scan-named PDF: OCR -> Claude -> rename."""
-    logger.info(f"Processing: {pdf_path.name}")
+    logger.info(f"Processing: {pdf_path.name} ({pdf_path.stat().st_size / 1024:.0f} KB)")
 
     # Extract text via OCR
+    logger.info(f"  OCR: extracting text from {pdf_path.name}...")
     ocr_text = extract_text(pdf_path, logger)
     if not ocr_text:
-        logger.warning(f"No text extracted from {pdf_path.name}, skipping")
+        logger.warning(f"  OCR: no text extracted from {pdf_path.name}, skipping")
         return False
+    logger.info(f"  OCR: extracted {len(ocr_text)} chars from {pdf_path.name}")
 
     # Ask Claude for a filename
+    logger.info(f"  AI: requesting filename suggestion for {pdf_path.name}...")
     new_name = determine_filename(ocr_text, pdf_path.name, client, model, logger)
     if not new_name:
-        logger.warning(f"Could not determine name for {pdf_path.name}, skipping")
+        logger.warning(f"  AI: could not determine name for {pdf_path.name}, skipping")
         return False
+    logger.info(f"  AI: suggested \"{new_name}\" for {pdf_path.name}")
 
     # Rename
     return safe_rename(pdf_path, new_name, dry_run, logger)
@@ -345,12 +349,22 @@ def watch_folder(
     logger.info(f"Watching {folder} for new scanned PDFs (Ctrl+C to stop)")
     logger.info(f"Polling every {WATCH_INTERVAL}s, settle time {SETTLE_TIME}s")
 
-    # Track files we've already seen (by name) to avoid reprocessing
-    known_files: set[str] = {f.name for f in find_scan_files(folder)}
-    logger.info(f"Starting with {len(known_files)} existing scan-named file(s)")
-
-    # Also track files we've processed (even if renamed) by original name
+    # Track files we've processed (by original name) to avoid reprocessing
     processed: set[str] = set()
+
+    # Process any existing scan-named files first
+    existing = find_scan_files(folder)
+    if existing:
+        logger.info(f"Found {len(existing)} existing scan-named file(s) to process")
+        for i, f in enumerate(existing, 1):
+            logger.info(f"[startup {i}/{len(existing)}] Processing existing file: {f.name}")
+            processed.add(f.name)
+            process_file(f, client, model, dry_run, logger)
+            if i < len(existing):
+                time.sleep(1)
+        logger.info(f"Finished processing existing files. Now watching for new ones...")
+    else:
+        logger.info("No existing scan-named files found. Watching for new ones...")
 
     try:
         while True:
@@ -359,7 +373,7 @@ def watch_folder(
             current_files = find_scan_files(folder)
             new_files = [
                 f for f in current_files
-                if f.name not in known_files and f.name not in processed
+                if f.name not in processed
             ]
 
             for f in new_files:
@@ -375,7 +389,6 @@ def watch_folder(
 
                 logger.info(f"New file detected: {f.name}")
                 processed.add(f.name)
-                known_files.add(f.name)
                 process_file(f, client, model, dry_run, logger)
 
     except KeyboardInterrupt:
