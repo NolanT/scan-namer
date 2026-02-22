@@ -1,0 +1,24 @@
+services:
+  scan-namer:
+    # To use the pre-built image from GitHub Container Registry:
+    image: ghcr.io/nolant/scan-namer:main
+    # To build locally instead, comment out 'image' above and uncomment:
+    # build: .
+    container_name: scan-namer
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      # Mount your Synology scan folder here
+      # Change the left side to your actual path, e.g.:
+      #   /volume1/scans:/scans
+      - /volume1/scans:/scans
+    # Default: watch mode (auto-renames new files)
+    # Uncomment below to customize:
+    # command: ["/scans", "--watch", "--settle-time", "15", "--watch-interval", "60"]
+    #
+    # For one-time batch mode instead of watch:
+    # command: ["/scans"]
+    #
+    # For dry-run (preview only):
+    # command: ["/scans", "--dry-run"]
