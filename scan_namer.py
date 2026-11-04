@@ -20,12 +20,16 @@ Usage:
     # Use a specific model (default: claude-haiku-4-5 for cost efficiency)
     python scan_namer.py /path/to/scans --model claude-sonnet-4-5
 
+    # Add a searchable text layer to PDFs already in named/ (rewrites them in place)
+    python scan_namer.py /path/to/scans --backfill
+
 Requirements:
     pip install anthropic pytesseract pdf2image Pillow
 
     System packages (apt/apk):
         tesseract-ocr
         poppler-utils
+        ocrmypdf        (adds the invisible, searchable text layer)
 
     Environment variable:
         ANTHROPIC_API_KEY=your-api-key
@@ -41,6 +45,7 @@ import json
 import time
 import shutil
 import logging
+import subprocess
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -74,6 +79,12 @@ SETTLE_TIME = 10
 
 # Polling interval for watch mode (seconds)
 WATCH_INTERVAL = 30
+
+# Searchable text layer (ocrmypdf). Pages that already have text are left alone.
+TEXT_LAYER = True
+OCR_JOBS = int(os.environ.get("OCR_JOBS", "1"))  # keep NAS CPU use low
+OCRMYPDF_TIMEOUT = 900  # seconds per file
+TEXT_LAYER_MIN_CHARS = 50  # below this, a PDF is treated as image-only
 
 # Subdirectory names for processed files
 NAMED_DIR = "named"
@@ -162,6 +173,67 @@ def extract_text(pdf_path: Path, logger: logging.Logger) -> str:
 
     combined = "\n\n".join(all_text)
     return combined[:OCR_MAX_CHARS] if combined else ""
+
+
+def pdf_text(pdf_path: Path, last_page: int | None = None) -> str:
+    """Text from the PDF's existing text layer (poppler pdftotext). Empty if none."""
+    cmd = ["pdftotext", "-layout", "-q"]
+    if last_page:
+        cmd += ["-l", str(last_page)]
+    cmd += [str(pdf_path), "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def has_text_layer(pdf_path: Path) -> bool:
+    return len(pdf_text(pdf_path)) >= TEXT_LAYER_MIN_CHARS
+
+
+def add_text_layer(pdf_path: Path, logger: logging.Logger, keep_mtime: bool = False) -> bool:
+    """Add an invisible OCR text layer to pdf_path in place, using ocrmypdf.
+
+    Page images are kept as they are (--optimize 0, plain PDF output), pages that
+    already contain text are skipped (--skip-text). On any failure the original
+    file is left untouched. Returns True if the file now has a text layer.
+    """
+    tmp = pdf_path.with_name(f".{pdf_path.name}.ocr-tmp")  # not *.pdf, so the watcher ignores it
+    st = pdf_path.stat()
+    cmd = [
+        "ocrmypdf", "--skip-text", "--output-type", "pdf", "--optimize", "0",
+        "--jobs", str(OCR_JOBS), "--quiet", str(pdf_path), str(tmp),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=OCRMYPDF_TIMEOUT)
+    except FileNotFoundError:
+        logger.warning("  Text layer: ocrmypdf is not installed; skipping")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning(f"  Text layer: ocrmypdf timed out on {pdf_path.name}; original kept")
+        tmp.unlink(missing_ok=True)
+        return False
+    if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        err = (r.stderr or "").strip().splitlines()
+        logger.warning(f"  Text layer: ocrmypdf failed on {pdf_path.name} (exit {r.returncode}): "
+                       f"{err[-1] if err else 'no output'}; original kept")
+        tmp.unlink(missing_ok=True)
+        return False
+    if not has_text_layer(tmp):
+        logger.info(f"  Text layer: no readable text found in {pdf_path.name}; original kept")
+        tmp.unlink(missing_ok=True)
+        return False
+    try:
+        shutil.copymode(pdf_path, tmp)
+    except Exception:
+        pass
+    os.replace(tmp, pdf_path)
+    if keep_mtime:
+        os.utime(pdf_path, (st.st_atime, st.st_mtime))
+    logger.info(f"  Text layer: added to {pdf_path.name} "
+                f"({st.st_size / 1024:.0f} KB -> {pdf_path.stat().st_size / 1024:.0f} KB)")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +368,16 @@ def process_file(
     """Process a single PDF: OCR -> Claude -> rename and move to named/, or move to failed/."""
     logger.info(f"Processing: {pdf_path.name} ({pdf_path.stat().st_size / 1024:.0f} KB)")
 
-    # Extract text via OCR
-    logger.info(f"  OCR: extracting text from {pdf_path.name}...")
-    ocr_text = extract_text(pdf_path, logger)
+    # Make the PDF searchable first, then reuse that text for naming
+    ocr_text = ""
+    if TEXT_LAYER and not dry_run:
+        if has_text_layer(pdf_path) or add_text_layer(pdf_path, logger):
+            ocr_text = pdf_text(pdf_path, last_page=OCR_MAX_PAGES)[:OCR_MAX_CHARS]
+
+    # Fall back to plain OCR of the first pages
+    if len(ocr_text.strip()) < 20:
+        logger.info(f"  OCR: extracting text from {pdf_path.name}...")
+        ocr_text = extract_text(pdf_path, logger)
     if not ocr_text:
         logger.warning(f"  OCR: no text extracted from {pdf_path.name}")
         logger.info(f"  Moving to {FAILED_DIR}/")
@@ -352,6 +431,36 @@ def process_folder(
 
     logger.info(f"Done: {success} named, {fail} failed")
     return success, fail
+
+
+def backfill_folder(folder: Path, dry_run: bool, logger: logging.Logger) -> tuple[int, int, int]:
+    """Add text layers to PDFs already in named/ that don't have one.
+
+    Rewrites files in place (same name, same look, original modified time kept).
+    Returns (added, skipped_already_text, failed).
+    """
+    named_dir = folder / NAMED_DIR
+    if not named_dir.is_dir():
+        logger.info(f"No {NAMED_DIR}/ folder to backfill")
+        return 0, 0, 0
+    files = sorted(f for f in named_dir.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
+    logger.info(f"Backfill: checking {len(files)} PDF(s) in {NAMED_DIR}/")
+    added = skipped = failed = 0
+    for i, f in enumerate(files, 1):
+        if has_text_layer(f):
+            skipped += 1
+            continue
+        if dry_run:
+            logger.info(f"[DRY RUN] [{i}/{len(files)}] would add text layer: {f.name}")
+            added += 1
+            continue
+        logger.info(f"[{i}/{len(files)}] {f.name}")
+        if add_text_layer(f, logger, keep_mtime=True):
+            added += 1
+        else:
+            failed += 1
+    logger.info(f"Backfill done: {added} added, {skipped} already searchable, {failed} failed")
+    return added, skipped, failed
 
 
 # ---------------------------------------------------------------------------
@@ -446,10 +555,15 @@ Environment:
     parser.add_argument("--dpi", type=int, default=200, help="OCR resolution (default: 200)")
     parser.add_argument("--settle-time", type=int, default=10, help="Seconds to wait for file to finish writing (default: 10)")
     parser.add_argument("--watch-interval", type=int, default=30, help="Seconds between folder checks in watch mode (default: 30)")
+    parser.add_argument("--no-text-layer", action="store_true", help="Don't add a searchable text layer to PDFs")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Add text layers to PDFs already in named/ (rewrites them in place), then exit")
 
     args = parser.parse_args()
 
-    # Apply config overrides
+    # Apply config overrides (module-level settings used by the functions above)
+    global OCR_DPI, SETTLE_TIME, WATCH_INTERVAL, TEXT_LAYER
+    TEXT_LAYER = not args.no_text_layer
     OCR_DPI = args.dpi
     SETTLE_TIME = args.settle_time
     WATCH_INTERVAL = args.watch_interval
@@ -469,6 +583,10 @@ Environment:
     logger.info(f"Model: {args.model}, DPI: {OCR_DPI}")
     if args.dry_run:
         logger.info("DRY RUN mode - no files will be renamed")
+
+    if args.backfill:
+        _, _, failed = backfill_folder(args.folder, args.dry_run, logger)
+        sys.exit(0 if failed == 0 else 1)
 
     # Initialize Claude client
     if not os.environ.get("ANTHROPIC_API_KEY"):

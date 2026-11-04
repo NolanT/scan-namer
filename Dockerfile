@@ -6,6 +6,7 @@ RUN apt-get update && \
         tesseract-ocr \
         tesseract-ocr-eng \
         poppler-utils \
+        ocrmypdf \
         libglib2.0-0 \
         libsm6 \
         libxext6 \

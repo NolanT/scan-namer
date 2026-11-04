@@ -7,10 +7,25 @@ Drop any PDF into the watched folder and it gets renamed to something like `2025
 ## How It Works
 
 1. Watches a folder for any PDF files
-2. Uses OCR (Tesseract) to extract text from the pages
-3. Sends the text to Claude AI to determine a descriptive filename with the document date
+2. Adds an invisible, searchable text layer to every page with [OCRmyPDF](https://ocrmypdf.readthedocs.io/) (Tesseract). The pages look exactly the same; pages that already have text are left alone. This makes scans searchable in Synology Universal Search, Spotlight, and any PDF viewer.
+3. Sends the first pages' text to Claude AI to determine a descriptive filename with the document date
 4. Moves the renamed file into the `named/` subdirectory
 5. Files that can't be read or named are moved to `failed/`
+
+Turn off step 2 with `--no-text-layer`. OCR uses one CPU core by default; set `OCR_JOBS=2` in the container environment to use more.
+
+### Making existing scans searchable (backfill)
+
+Files that were named before the text layer existed are image-only. To add text layers to everything already in `named/` (same filenames, same look, original modified dates kept; files that already have text are skipped):
+
+```bash
+# preview
+docker compose run --rm scan-namer /scans --backfill --dry-run
+# do it
+docker compose run --rm scan-namer /scans --backfill
+```
+
+This rewrites those PDFs in place, so make sure your NAS snapshots/backups are current first.
 
 ## Quick Start (Synology NAS)
 
