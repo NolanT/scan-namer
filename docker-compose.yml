@@ -8,11 +8,15 @@ services:
     restart: unless-stopped
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - SCAN_NAMER_MODEL=claude-haiku-5-5   # override the Claude model
+      # - OCR_JOBS=2                          # CPU cores for OCR (default 1)
+      # - FILING_ROOT=/archive                # enable folder suggestions (see README)
+      # - FILING_EXCLUDE=Private,Old Backups  # folders to leave out of suggestions
     volumes:
-      # Mount your Synology scan folder here
-      # Change the left side to your actual path, e.g.:
-      #   /volume1/scans:/scans
+      # Mount your scan folder here (change the left side to your actual path)
       - /volume1/scans:/scans
+      # Optional, for folder suggestions: your document archive, READ-ONLY
+      # - /volume1/documents:/archive:ro
     # Default: watch mode (auto-renames new files)
     # Uncomment below to customize:
     # command: ["/scans", "--watch", "--settle-time", "15", "--watch-interval", "60"]
